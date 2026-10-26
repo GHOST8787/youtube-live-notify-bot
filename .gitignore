@@ -1,6 +1,6 @@
 .env
 state.json
-check_live.log
+check_live.log*
 __pycache__/
 run_check_live.vbs
 config.json
