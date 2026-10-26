@@ -140,6 +140,11 @@ POST_CHECK_INTERVAL = 1800   # 社群貼文每 30 分鐘檢查一次
 SCHEDULE_KEYWORDS = ["週表", "周表", "直播排程"]
 POSTS_URL = f"{CHANNEL_URL}/posts"
 HTTP_TIMEOUT = 30
+FEED_RETRIES = 3            # feed 同一輪重試次數（零配額，重試不花錢）
+FEED_RETRY_WAIT = 2         # 重試間隔秒數
+GAP_THRESHOLD = 5 * 60      # 兩輪間隔超過這麼久＝這段沒在偵測（休眠／斷網／卡住），記進當天空窗
+LOG_MAX_BYTES = 5 * 1024 * 1024   # log 超過就轉存成 .1（只留一份舊的）
+UPLOADS_PLAYLIST = "UU" + CHANNEL_ID[2:]   # 頻道上傳清單；feed 掛掉時用 playlistItems.list（1 unit）頂
 
 # 狀態檔
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -156,6 +161,8 @@ def log(msg: str):
     line = f"[{ts}] {msg}"
     print(line)
     try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
@@ -163,10 +170,30 @@ def log(msg: str):
 
 
 def fetch_feed() -> list[tuple[str, str]]:
-    """抓頻道 RSS feed，回傳 [(video_id, title), ...]，新的在前"""
-    req = urllib.request.Request(FEED_URL, headers={"User-Agent": f"{BOT_LABEL}/1.0"})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        root = ET.fromstring(resp.read())
+    """抓頻道 RSS feed，回傳 [(video_id, title), ...]，新的在前。
+
+    YouTube 這個端點本身時好時壞（2026-09-05 實測同一 URL 連打 12 次得
+    5 次 200／6 次 404／1 次 500），一次失敗就會讓整輪五個步驟連
+    save_state 都被跳掉，所以同一輪重試 FEED_RETRIES 次。
+    這是公開 RSS，不帶 API key、零配額，重試不花錢。"""
+    last_err: Exception | None = None
+    for attempt in range(1, FEED_RETRIES + 1):
+        try:
+            req = urllib.request.Request(FEED_URL, headers={"User-Agent": f"{BOT_LABEL}/1.0"})
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                root = ET.fromstring(resp.read())
+            if attempt > 1:
+                log(f"feed 第 {attempt} 次重試成功")
+            break
+        except Exception as e:
+            last_err = e
+            if _is_offline(e):
+                raise   # 本機沒網路（DNS 解析不到），重試沒用
+            if attempt < FEED_RETRIES:
+                log(f"feed 第 {attempt} 次失敗（{type(e).__name__}: {e}），{FEED_RETRY_WAIT} 秒後重試")
+                time.sleep(FEED_RETRY_WAIT)
+    else:
+        raise last_err
     out = []
     for e in root.findall(f"{ATOM}entry"):
         vid = e.findtext(f"{YT_NS}videoId")
@@ -174,6 +201,36 @@ def fetch_feed() -> list[tuple[str, str]]:
         if vid:
             out.append((vid, title))
     return out
+
+
+def _is_offline(e: Exception) -> bool:
+    return isinstance(e, urllib.error.URLError) and isinstance(getattr(e, "reason", None), socket.gaierror)
+
+
+def fetch_uploads_api() -> list[tuple[str, str]]:
+    """feed 備援：頻道上傳清單 playlistItems.list（1 quota unit）。
+    2026-10-26 實測與 feed 前 15 支 videoId 與順序完全一致。"""
+    url = (
+        "https://www.googleapis.com/youtube/v3/playlistItems"
+        f"?part=contentDetails,snippet&maxResults=15&playlistId={UPLOADS_PLAYLIST}&key={YT_API_KEY}"
+    )
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=HTTP_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return [(i["contentDetails"]["videoId"], i["snippet"].get("title", ""))
+            for i in data.get("items", [])]
+
+
+def fetch_entries() -> list[tuple[str, str]]:
+    """先 feed（零配額），三次都失敗改走 API 上傳清單；沒網路就直接丟出去。"""
+    try:
+        return fetch_feed()
+    except Exception as e:
+        if _is_offline(e):
+            raise
+        log(f"feed 重試 {FEED_RETRIES} 次都失敗（{type(e).__name__}: {e}），改用 API 上傳清單")
+        entries = fetch_uploads_api()
+        log(f"API 上傳清單備援成功：{len(entries)} 筆")
+        return entries
 
 
 def videos_lookup(ids: list[str]) -> dict:
@@ -361,9 +418,14 @@ def send_waiting_preannounce(video_id: str, title: str, scheduled: float | None)
     return bool(send_webhook(WEBHOOK_FAN, payload))
 
 
-def send_heartbeat(waiting: dict):
-    """每天 20:00 後的心跳：當天還沒開台時發到管理頻道，tag 管理者"""
+def send_heartbeat(waiting: dict, gap_min: int = 0, missed: str = ""):
+    """每天 20:00 後的心跳：當天還沒開台時發到管理頻道，tag 管理者。
+    空窗（休眠／斷網）與「開播又結束沒通知到」照實寫，不讓心跳說謊。"""
     desc = "常駐偵測運作中（feed 每分鐘掃描、待機室開播即通知）。今天到目前為止沒有偵測到開台。"
+    if missed:
+        desc = f"⚠️ 今天有一場開播又結束、在輪詢間隔內沒通知到：{missed}"
+    if gap_min:
+        desc += f"\n\n⚠️ 今天約有 {gap_min} 分鐘沒在偵測（電腦休眠、斷網或卡住），這段期間如果有開台不會被抓到。"
     if waiting:
         lines = "\n".join(
             f"• {w.get('title', '(無標題)')}（預定 {fmt_local(w.get('scheduled'))}）"
@@ -597,7 +659,7 @@ def run_cycle(state: dict):
     waiting: dict = state.setdefault("waiting", {})
     notified: list = state.setdefault("notified_ids", [])
 
-    entries = fetch_feed()
+    entries = fetch_entries()
     feed_titles = dict(entries)
     new_ids = [vid for vid, _ in entries if vid not in known]
 
@@ -644,6 +706,8 @@ def run_cycle(state: dict):
             if vid in waiting:
                 if lsd.get("actualEndTime"):
                     log(f"待機室 {vid} 已開播並結束於輪詢間隔內，未及通知：{title}")
+                    # 讓 20:00 心跳照實說「有一場沒通知到」，而不是「今天沒開台」
+                    state.setdefault("missed_live", {})[today_str()] = title
                 else:
                     log(f"待機室 {vid} 已取消：{title}")
                 waiting.pop(vid)
@@ -664,9 +728,47 @@ def maybe_heartbeat(state: dict):
         return
     if state.get("last_heartbeat_date") == today or state.get("last_live_date") == today:
         return
-    log("20:00 心跳：今天尚未偵測到開台")
-    send_heartbeat(state.get("waiting", {}))
+    gap_min = int(state.get("gap_seconds", {}).get(today, 0) // 60)
+    missed = state.get("missed_live", {}).get(today, "")
+    log(f"20:00 心跳：今天尚未偵測到開台（空窗 {gap_min} 分鐘）")
+    send_heartbeat(state.get("waiting", {}), gap_min, missed)
     state["last_heartbeat_date"] = today
+
+
+def record_gap(state: dict, prev: float, now: float):
+    """兩輪之間隔太久＝那段沒在偵測，按日期累計秒數（只留最近 7 天）。"""
+    gap = now - prev - FEED_POLL_INTERVAL
+    if gap < GAP_THRESHOLD:
+        return
+    log(f"偵測空窗 {int(gap // 60)} 分鐘：{fmt_local(prev)} → {fmt_local(now)}（休眠／斷網／卡住）")
+    gaps = state.setdefault("gap_seconds", {})
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    gaps[day] = gaps.get(day, 0) + gap
+    for k in sorted(gaps)[:-7]:
+        gaps.pop(k)
+    missed = state.get("missed_live", {})
+    for k in sorted(missed)[:-7]:
+        missed.pop(k)
+
+
+_ES_CONTINUOUS, _ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+_awake = False
+
+
+def keep_awake(on: bool):
+    """追蹤待機室期間擋系統閒置睡眠（闔螢幕擋不住），沒有待機室就放掉。
+    2026-08-23 電腦休眠整場漏掉才加。"""
+    global _awake
+    if on == _awake or os.name != "nt":
+        return
+    try:
+        import ctypes
+        flags = _ES_CONTINUOUS | (_ES_SYSTEM_REQUIRED if on else 0)
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        _awake = on
+        log("待機室追蹤中，擋系統睡眠" if on else "沒有待機室了，恢復允許睡眠")
+    except Exception as e:
+        log(f"keep_awake 失敗: {e!r}")
 
 
 def main():
@@ -678,17 +780,25 @@ def main():
     else:
         log("DISCORD_TOKEN 未設定，\U0001f44d 自動發週表停用（偵測到週表仍會通知管理頻道，需手動發）")
     last_alive = time.time()
+    last_cycle = time.time()
 
+    # 五步各自 try：feed 掛掉不再拖累週表、👍 確認、心跳與存檔
+    steps = (run_cycle, check_schedule_posts, check_pending_confirmation,
+             check_waiting_confirmation, maybe_heartbeat)
     while True:
+        now = time.time()
+        record_gap(state, last_cycle, now)
+        last_cycle = now
+        for step in steps:
+            try:
+                step(state)
+            except Exception as e:
+                log(f"本輪 {step.__name__} 失敗: {type(e).__name__}: {e}")
+        keep_awake(bool(state.get("waiting")))
         try:
-            run_cycle(state)
-            check_schedule_posts(state)
-            check_pending_confirmation(state)
-            check_waiting_confirmation(state)
-            maybe_heartbeat(state)
             save_state(state)
         except Exception as e:
-            log(f"本輪失敗: {type(e).__name__}: {e}")
+            log(f"本輪 save_state 失敗: {type(e).__name__}: {e}")
 
         if once:
             log(f"--once 完成：known={len(state.get('known_ids', []))} "
